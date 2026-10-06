@@ -1,0 +1,48 @@
+# Build directories
+build/
+bin/
+obj/
+out/
+.cmake/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.dir/
+
+# Compiled object files and executables
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+*.pdb
+*.idb
+*.ilk
+*.exp
+
+# Profiling and results
+*.ncu-rep
+*.nsys-rep
+profile_out/
+*.csv
+!results/benchmark_results_example.csv
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
