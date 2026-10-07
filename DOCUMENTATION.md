@@ -1,143 +1,69 @@
-# CUDA Kernel Library: Comprehensive Deep-Dive Documentation
+# Implementation and experimental methodology
 
-This document serves as a complete architectural, conceptual, and mathematical breakdown of the Custom CUDA Kernel Library for Machine Learning Operators (MatMul, LayerNorm, Softmax).
+## Objective and scope
 
----
+Investigate hand-tuned FP32 CUDA implementations of MatMul, LayerNorm and Softmax for documented model-related shapes. Completion means reproducible builds, validated outputs, comparable vendor measurements and profiling evidence. A speedup claim is limited to the actual shape, GPU, precision, library version and timing protocol.
 
-## 1. Core CUDA & GPU Concepts Explained
+The reference workload is specified in TARGET_WORKLOAD.md. Synthetic inputs are deterministic; this repository does not implement an end-to-end GPT-2 model or measure production traffic.
 
-Before diving into the operators, it is crucial to understand the GPU execution model and memory hierarchy, as every optimization in this project is designed around these physical constraints.
+## Mathematics
 
-### 1.1 The Execution Model: Grids, Blocks, and Warps
-- **Thread:** The fundamental unit of execution. Each thread computes a small piece of the output (e.g., one element or a small 4x4 tile).
-- **Warp:** A group of 32 threads executing in lockstep (SIMT - Single Instruction, Multiple Threads). If threads in a warp branch in different directions (e.g., an `if/else` statement), the execution is serialized. This is called **Warp Divergence**.
-- **Block:** A group of threads (up to 1024) that execute on the same Streaming Multiprocessor (SM). Threads in a block can communicate rapidly using Shared Memory and synchronize using `__syncthreads()`.
-- **Grid:** The collection of all blocks launched for a single kernel.
+MatMul: C[M,N] = A[M,K] B[K,N], with C[i,j] = sum_k A[i,k] B[k,j]. The conventional operation count is 2*M*K*N. Inputs and outputs are contiguous row-major FP32. cuBLAS receives swapped operands to compute C-transpose = B-transpose A-transpose without moving the data.
 
-### 1.2 The GPU Memory Hierarchy
-Optimizing CUDA kernels is almost entirely about managing data movement across this hierarchy. Computations are extremely fast; memory fetches are extremely slow.
+LayerNorm computes statistics independently across each row: mean = sum(x)/H; variance = sum((x-mean)^2)/H; y[i] = gamma[i]*(x[i]-mean)/sqrt(variance+epsilon)+beta[i]. Gamma and beta are feature vectors. Default epsilon is 1e-5. The variance divisor is H, not H-1.
 
-1. **Global Memory (VRAM):** The largest but slowest memory pool (400-800 cycle latency). Optimizations aim to minimize reads/writes here.
-2. **L2 Cache:** Shared across the whole GPU.
-3. **L1 Cache / Shared Memory:** Extremely fast memory located *on the SM* itself (~4-30 cycle latency). **Shared memory is software-managed cache**. We explicitly load data from Global to Shared memory so multiple threads can reuse it without going back to VRAM.
-4. **Registers:** The fastest memory, private to each thread. Excessive register usage, however, limits the number of threads that can run concurrently (occupancy).
+Softmax: m=max(x); s=sum(exp(x-m)); y=exp(x-m)/s. Subtracting the maximum preserves the normalized result and prevents positive exponential overflow for finite inputs. Output rows are nonnegative and sum to approximately 1.
 
-### 1.3 Memory Coalescing & Vectorization
-When threads in a warp read from Global Memory, the hardware groups these reads into 32-byte, 64-byte, or 128-byte transactions. 
-- **Coalesced Access:** If thread 0 reads address 0, thread 1 reads address 1, etc., the hardware fetches it in one chunk.
-- **Vectorized Loads (`float4`):** Instead of one thread loading one 32-bit `float`, we can cast the pointer to `float4` (a 128-bit struct). This forces the hardware to fetch 4 consecutive floats at once per thread, drastically improving bandwidth utilization.
+## Implementations
 
-### 1.4 Warp-Level Primitives (`__shfl_down_sync`)
-Traditionally, threads communicate via Shared Memory. However, writing to shared memory and reading from it requires a `__syncthreads()` barrier, which stalls execution. 
-Modern GPUs allow threads in the same warp to read registers directly from other threads using "Shuffle" instructions (e.g., `__shfl_down_sync`). This is used heavily in our optimized LayerNorm and Softmax for lightning-fast reductions (sums/maxes) without touching shared memory.
+MatMul V1 assigns one output element to each thread. V2 cooperatively loads 16x16 or 32x32 tiles into shared memory, synchronizes, computes and synchronizes before reusing storage. V3 computes a 4x4 output patch per thread using local accumulators. V4 uses scalar shared-memory tile loads and grouped/unrolled multiply-adds; it has no explicit float4 global loads.
 
----
+The shape kernel uses coalesced cooperative tile loads, transposed/padded A storage and interleaved output columns to reduce shared-memory bank conflicts. Ordinary shapes use a 64x64 output tile, K depth 16, 256 threads and 4x4 register patches. Short row counts use 16x64 output tiles. A single input row uses a GEMV specialization that splits K across eight warps and combines their partial sums.
 
-## 2. Operator 1: Matrix Multiplication (MatMul)
+LayerNorm V1 uses shared-memory tree reductions. V2/V3 use warp shuffles plus shared memory and barriers between warps. V4 accumulates Welford statistics locally, merges tuples of mean/M2/count, then rereads input to normalize. Its float4 path requires both alignment and compatible row stride; otherwise it falls back to V3.
 
-**The Math:** $C_{i,j} = \sum_{k=0}^{K-1} A_{i,k} \times B_{k,j}$
-For matrices $A (M \times K)$ and $B (K \times N)$.
+The resident LayerNorm kernel retains a row's values in registers through both statistics reductions and output. Transformer widths use 128 threads per row with 6/8/24/32 values per thread, depending on width. Small widths use one warp per row. This reduces input traffic while avoiding the high register pressure of a wide row assigned entirely to one warp.
 
-### Progression of Optimizations
+Softmax V1 stores intermediate exponentials in output memory and performs shared-memory max/sum reductions. V2 moves the maximum reduction into warps. V3 uses warp reductions for both statistics with shared-memory cross-warp communication. V4 uses online max/sum merging and float4 reads, with a safe fallback for alignment/stride.
 
-#### V1: Naive (The Baseline)
-- **Concept:** One thread computes exactly one element of $C$.
-- **Flaw:** To compute $C_{i,j}$, the thread reads $K$ elements from $A$ and $K$ elements from $B$. Every other thread in the same row reads the exact same row of $A$. This causes massive redundant Global Memory reads. It is severely Memory Bandwidth Bound.
+The shape Softmax assigns one warp to a row and four rows to a block. Values remain in registers through max, exponential sum and output, removing intermediate global-memory traffic. It uses the CUDA __expf intrinsic explicitly; all implementations are validated numerically before timing. Widths above 4096 use V3.
 
-#### V2: Tiled Shared Memory (The Workhorse)
-- **Concept:** Divide the matrices into smaller blocks (e.g., 32x32 tiles). A block of threads cooperatively loads a 32x32 tile of $A$ and $B$ from Global Memory into Shared Memory.
-- **Why it works:** Once the tile is in Shared Memory, the threads perform $32$ multiply-adds using the fast shared memory. This reduces Global Memory traffic by a factor of 32.
-- **Implementation detail:** Uses `__syncthreads()` to ensure the whole tile is loaded before computing, and another `__syncthreads()` before loading the next tile to avoid overwriting data currently in use.
+## CUDA execution and API contract
 
-#### V3: Register Blocking (1D/2D Thread Coarsening)
-- **Concept:** Instead of one thread computing one element, one thread computes a $4 \times 4$ tile of $C$, holding the 16 intermediate sums in its private **Registers**.
-- **Why it works:** Increases "Arithmetic Intensity" (ratio of math operations to memory operations). It hides the latency of fetching from Shared Memory because the thread does more math per fetch.
+A grid contains blocks, blocks contain threads, and threads are scheduled in warps of 32. Blocks cooperate through shared memory and __syncthreads. Warp shuffles exchange register values inside a warp; they do not replace synchronization between warps.
 
-#### V4: Vectorized and Unrolled (The Peak FP32)
-- **Concept:** Uses `float4` to load data from Global Memory and `#pragma unroll 8` on the inner loop.
-- **Why it works:** Unrolling the loop tells the compiler to write out the FMA (Fused Multiply-Add) instructions sequentially without loop counter checks. This allows the GPU instruction scheduler to perfectly pipeline math operations while waiting for memory.
+Public launchers validate host arguments before launching. Rows may be zero (no-op); feature/reduction dimensions must be positive. Null buffers for nonempty work, invalid epsilon and element counts above INT_MAX are rejected. Buffers must be contiguous FP32 device memory and respect the non-aliasing contract. General finite ranges and adversarial data require their own numerical validation; passing the provided tests is not a proof for all possible inputs.
 
-#### Baseline: cuBLAS (The Vendor Standard)
-- Uses proprietary NVIDIA assembly (SASS) and Tensor Cores (if enabled). 
-- **The Layout Trick:** cuBLAS expects Column-Major matrices (Fortran style), but C/C++ uses Row-Major. Instead of transposing the matrices in memory (which is slow), we use the mathematical identity: $C^T = B^T \times A^T$. We swap the order of inputs to cuBLAS to get the correct Row-Major output.
+Operations use stream 0 by default. cuda_utils.cuh exposes a thread-local execution stream used internally for benchmark capture. If applications select a nondefault stream, they must synchronize it before reading results with their own transfer code. cuBLAS handles should not be shared concurrently between threads without appropriate coordination.
 
----
+## Dispatcher and tuning
 
-## 3. Operator 2: Layer Normalization (LayerNorm)
+The dispatcher checks a mutex-protected process-local cache keyed by operator, shape and CUDA device. MatMul keys distinguish availability of a vendor handle. LayerNorm keys encode epsilon's exact FP32 bits.
 
-**The Math:** 
-Normalizes data across the features/hidden dimension for each item in a batch.
-1. Mean: $\mu = \frac{1}{H} \sum x_i$
-2. Variance: $\sigma^2 = \frac{1}{H} \sum (x_i - \mu)^2$
-3. Output: $y_i = \gamma \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta$
+The tuner initializes deterministic finite inputs, computes an independent reference (CPU for norms, cuBLAS for MatMul), rejects incorrect candidates and compares medians across three timing trials. MatMul includes V1-V4, the shape kernel, both V2 tile sizes and cuBLAS when a handle is supplied. Norm tuners compare the four legacy variants and the shape kernel. The target benchmark evaluates the tuned custom dispatcher alongside individual variants. Tuning cost is excluded from steady-state measurements.
 
-### Progression of Optimizations
+## Benchmark protocol
 
-#### V1 & V2: Shared Memory Reduction
-- **Concept:** One block handles one row (one batch item). Threads cooperatively sum the row to find the mean, storing intermediate sums in Shared Memory.
-- **Flaw:** It requires passing over the Global Memory array multiple times (Pass 1: find mean, Pass 2: find variance, Pass 3: write output).
+The target benchmark uses FP32 inputs/outputs. cuBLAS runs SGEMM in pedantic FP32 math mode. cuDNN LayerNorm uses its inference graph and a plan chosen by vendor heuristics; cuDNN Softmax uses accurate instance mode. Plan creation and buffer binding occur outside replayed GPU timing. These are versioned default vendor baselines, not an exhaustive search over all vendor configurations or precisions.
 
-#### V3: Warp-Level Primitives
-- **Concept:** Replaces Shared Memory reductions with `warp_reduce_sum` using `__shfl_down_sync`. 
-- **Why it works:** Eliminates `__syncthreads()` barriers. The SM doesn't have to wait for the slowest thread to reach the barrier; warps independently reduce their data.
+All outputs are checked before measurement. NaN/Inf is rejected. The target comparison uses per-element absolute plus relative tolerance (1e-4 + 1e-4*abs(reference)); original standalone correctness suites use their specified absolute tolerances. Softmax additionally checks nonnegative values and row sums within 1e-4.
 
-#### V4: Welford's Online Algorithm + Vectorization (The Peak)
-- **Concept:** In standard math, finding variance requires knowing the mean first (a two-pass algorithm). **Welford's Algorithm** is a mathematical trick to compute *both* the mean and the variance in a **single pass**.
-- **The Math (Welford):** 
-  As we read a new value $x$:
-  $\Delta = x - \text{mean}$
-  $\text{mean} = \text{mean} + \frac{\Delta}{N}$
-  $M_2 = M_2 + \Delta \times (x - \text{mean})$  *(where $M_2$ is the sum of squared diffs)*
-- **Why it works:** We cut Global Memory reads entirely in half. Combined with `float4` vectorization, this kernel operates at the absolute physical limit of the GPU's memory bandwidth.
+A benchmark performs 20 warm-ups, calibrates a repeat count capped at 64, captures repeated launches on a dedicated CUDA stream, and times graph replay with CUDA events. Each event interval is divided by the captured launch count. Default evaluation uses 5 independent trials and 50 samples per trial; variant order rotates between trials. Allocation, host-device transfers, tuning, graph capture/instantiation and plan setup are excluded. Reused buffers can be cache-resident. Results measure steady-state operator execution, not model latency or CPU launch latency.
 
----
+Aggregate average = mean of trial averages; aggregate median = median of trial medians. The trials CSV retains individual measurements. Metadata records GPU, runtime/driver API versions, precision, seeds and timing settings. TFLOPS = FLOPs/(average_ms*1e9). Norm TFLOPS is not supplied; zero in that column does not mean zero work.
 
-## 4. Operator 3: Softmax
+Speedup against V1 = V1 latency/custom latency. Vendor speedup = vendor latency/custom latency. Ratios above 1 indicate improvement. A reported repeatable vendor win requires at least three trials and a ratio >=1.05 in every trial, evaluated using medians. This is a conservative repeatability criterion, not a statistical confidence interval. Losses remain in the report. Hardware clock/power behavior and workload ordering can still affect results.
 
-**The Math (Numerically Stable):**
-1. Max: $M = \max(x_i)$ *(Prevents exponential overflow)*
-2. Sum of Exps: $S = \sum e^{x_i - M}$
-3. Output: $y_i = \frac{e^{x_i - M}}{S}$
+## Profiling
 
-### Progression of Optimizations
+scripts/profile.ps1 profiles one representative shape for each operator with Nsight Compute's full metric set. Reports are stored under results/profiles. Profiler-instrumented CSVs are kept separate from benchmark evidence. Basic/full report inspection can reveal register usage, occupancy, memory throughput, shared-memory conflicts and stalls; low throughput alone does not establish a single bottleneck.
 
-#### V1, V2, V3: Multi-Pass Reductions
-- Very similar progression to LayerNorm. V1 uses Shared Memory. V2/V3 transition to Warp-level primitives.
-- **Flaw:** Still requires multiple passes. Find Max -> Pass again to find Sum of Exps -> Pass again to write outputs.
+The initial LayerNorm profile found 80 registers/thread, 50% theoretical occupancy, 13.31% achieved occupancy and only 0.27 waves/SM. This motivated a 128-thread resident-row kernel with fewer retained values per thread. The initial report is layernorm_initial.ncu-repz; final reports describe the revised implementation. Profiling duration must not be compared directly to uninstrumented graph timings.
 
-#### V4: Milakov's Online Softmax Algorithm (The Peak)
-- **Concept:** Developed by Maxim Milakov in 2018, this algorithm computes the maximum and the sum of exponentials simultaneously in a **single pass**.
-- **The Math (Milakov):**
-  If we maintain a `current_max` and `current_sum`, and we encounter a new element $x$:
-  If $x > \text{current\_max}$:
-  $\quad \text{new\_sum} = \text{current\_sum} \times e^{\text{current\_max} - x} + e^{x - x} $
-  $\quad \text{current\_max} = x$
-  Else:
-  $\quad \text{new\_sum} = \text{current\_sum} + e^{x - \text{current\_max}}$
-- **Why it works:** When a new absolute maximum is found, the running sum is "rescaled" down by the difference in the exponents. This perfectly preserves the math while only reading the input tensor from Global Memory exactly once.
+Compute Sanitizer memcheck validates memory accesses; racecheck checks shared-memory hazards. Logs accompany the final validation. Test coverage includes odd row widths, offset device pointers, constants, extreme finite Softmax logits, dispatcher selections and rejection of nonfinite comparisons.
 
----
+## Reproduction and limitations
 
-## 5. Library Architecture & Tooling
+Use build.bat, CTest and benchmark_targets as documented in README.md. run_all.bat propagates failures instead of continuing with misleading success. Analyzer paths are independent of the working directory when auto-detected, and --csv can explicitly select a dataset. Optional charts group comparable shapes and separate operators.
 
-### 5.1 Kernel Dispatcher & Auto-Tuner (`kernel_dispatcher.cu`)
-A modern ML framework (like PyTorch) doesn't ask the user which kernel version to run. It dispatches automatically.
-- **Heuristics:** We route small matrices to V1 (naive is faster for tiny data because there's no shared memory setup overhead), and large matrices to V4 or cuBLAS.
-- **Auto-Tuner:** At startup, the framework can run a "sweep" (testing V1, V2, V3, and V4 briefly) and cache the fastest version in a Hash Map (Dictionary) keyed by the tensor shape.
-
-### 5.2 Benchmarking Framework (`benchmark.cuh`)
-CPU timing (`std::chrono`) is inaccurate for GPUs because GPU calls are asynchronous. 
-- We use **CUDA Events** (`cudaEventRecord`).
-- **Warm-up iterations:** Essential because the first time a kernel runs, the GPU takes time to load the PTX code into instruction caches (JIT overhead), and the GPU clock speeds may be in a low-power state.
-- **Correctness Checker:** Compares GPU output to a strict CPU reference implementation using Maximum Absolute Error and Maximum Relative Error tolerances.
-
-### 5.3 Profiling with Nsight Compute (NCU)
-To prove our optimizations work, we rely on hardware metrics:
-- **`sm__throughput`:** Computes how much of the SM's math units are actually busy.
-- **`l1tex__t_bytes_pipe_lsu_mem_global_op_ld`:** The actual number of bytes read from VRAM. When we implement V2 (Tiling), this number drops drastically, proving the optimization worked.
-- **`smsp__warp_issue_stalled_long_scoreboard`:** Measures how often the GPU is frozen waiting for memory to arrive. Register blocking (V3) aims to reduce this specific metric.
-
----
-
-## Conclusion
-This library bridges the gap between high-level machine learning and low-level hardware physics. By progressively managing memory hierarchies (tiling), exploiting hardware execution models (warp primitives), and rewriting mathematical formulas to minimize memory fetches (Welford, Milakov), we achieve order-of-magnitude speedups over naive implementations.
+The project currently implements forward FP32 operators on one GPU. Unsupported extensions include backward/training, arbitrary tensor strides, batched GEMM, FP16/BF16/INT8, Tensor Core kernels, causal masked/fused attention, persistent tuning files and PyTorch integration. There is no claim of vendor superiority across all shapes or GPUs. Read the recorded results for the actual scope of any measured speedup.

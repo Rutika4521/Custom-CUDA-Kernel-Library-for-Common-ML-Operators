@@ -1,90 +1,60 @@
-cmake_minimum_required(VERSION 3.18)
-
-project(cuda_kernel_library CUDA CXX)
-
-# ── CUDA / C++ standard ───────────────────────────────────────────────────────
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CXX_STANDARD  17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# ── GPU architecture ─────────────────────────────────────────────────────────
-# Change this to match your GPU:
-#   RTX 30xx (Ampere)      → 86
-#   RTX 40xx (Ada)         → 89
-#   RTX 50xx (Blackwell)   → 120   (requires CUDA 12.4+)
-#   A100                   → 80
-#   H100                   → 90
+cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures")
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architecture (RTX 5050: 120-real)")
 endif()
-
-message(STATUS "Building for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-message(STATUS "CXX  compiler: ${CMAKE_CXX_COMPILER}")
-message(STATUS "CUDA compiler: ${CMAKE_CUDA_COMPILER}")
-
-# ── Include directories ───────────────────────────────────────────────────────
-include_directories(${CMAKE_SOURCE_DIR}/include)
-
-# ── Find cuBLAS via CUDAToolkit ───────────────────────────────────────────────
+project(cuda_kernel_library LANGUAGES CUDA CXX)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(CUDAToolkit REQUIRED)
-
-# ── Shared kernel library ─────────────────────────────────────────────────────
-add_library(cuda_kernels_lib STATIC
-    src/matmul.cu
-    src/layernorm.cu
-    src/softmax.cu
-    src/kernel_dispatcher.cu
-)
-target_include_directories(cuda_kernels_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
+include(CTest)
+add_library(cuda_kernels_lib STATIC src/matmul.cu src/layernorm.cu src/softmax.cu
+    src/shape_kernels.cu src/kernel_dispatcher.cu)
+target_include_directories(cuda_kernels_lib PUBLIC include)
 target_link_libraries(cuda_kernels_lib PUBLIC CUDA::cublas CUDA::cudart)
-set_target_properties(cuda_kernels_lib PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
-# ── Main executable ───────────────────────────────────────────────────────────
+set_target_properties(cuda_kernels_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(cuda_kernels_lib PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo;--ptxas-options=-v>)
+option(CUDA_KERNELS_FAST_MATH "Enable approximate intrinsics; validate error" OFF)
+if(CUDA_KERNELS_FAST_MATH)
+    target_compile_options(cuda_kernels_lib PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
 add_executable(cuda_kernel_library src/main.cu)
 target_link_libraries(cuda_kernel_library PRIVATE cuda_kernels_lib)
-set_target_properties(cuda_kernel_library PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
-# ── Test executables ──────────────────────────────────────────────────────────
-foreach(test_name test_matmul test_layernorm test_softmax)
+foreach(test_name test_matmul test_layernorm test_softmax test_edge_cases)
     add_executable(${test_name} tests/${test_name}.cu)
     target_link_libraries(${test_name} PRIVATE cuda_kernels_lib)
-    set_target_properties(${test_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
-
-# ── Standalone benchmark executables ─────────────────────────────────────────
 foreach(bench_name benchmark_matmul benchmark_layernorm benchmark_softmax)
     add_executable(${bench_name} benchmarks/${bench_name}.cu)
     target_link_libraries(${bench_name} PRIVATE cuda_kernels_lib)
-    set_target_properties(${bench_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endforeach()
+add_executable(benchmark_targets benchmarks/benchmark_targets.cu src/vendor_baselines.cpp)
+target_link_libraries(benchmark_targets PRIVATE cuda_kernels_lib)
+set(CUDNN_ROOT "" CACHE PATH "cuDNN archive root")
+file(GLOB _cudnn_local "${CMAKE_SOURCE_DIR}/third_party/cudnn-windows*")
+find_path(CUDNN_INCLUDE_DIR cudnn.h HINTS ${CUDNN_ROOT} $ENV{CUDNN_ROOT} ${_cudnn_local} PATH_SUFFIXES include)
+find_library(CUDNN_LIBRARY NAMES cudnn HINTS ${CUDNN_ROOT} $ENV{CUDNN_ROOT} ${_cudnn_local} PATH_SUFFIXES lib lib/x64)
+if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
+    target_compile_definitions(benchmark_targets PRIVATE CUDA_KERNELS_HAS_CUDNN=1)
+    target_include_directories(benchmark_targets PRIVATE ${CUDNN_INCLUDE_DIR})
+    target_link_libraries(benchmark_targets PRIVATE ${CUDNN_LIBRARY})
+    get_filename_component(_cudnn_root "${CUDNN_INCLUDE_DIR}" DIRECTORY)
+    file(GLOB _cudnn_dlls "${_cudnn_root}/bin/*.dll")
+    foreach(_dll IN LISTS _cudnn_dlls)
+        add_custom_command(TARGET benchmark_targets POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_dll}" "$<TARGET_FILE_DIR:benchmark_targets>")
+    endforeach()
+    message(STATUS "cuDNN comparisons enabled: ${CUDNN_LIBRARY}")
+else()
+    message(WARNING "cuDNN absent: vendor comparison for norms unavailable. Set CUDNN_ROOT.")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/results")
+add_custom_target(run_tests COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS test_matmul test_layernorm test_softmax test_edge_cases WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# ── Ensure results directory exists at build time ────────────────────────────
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/results)
-
-# ── Convenience target: run all tests ────────────────────────────────────────
-add_custom_target(run_tests
-    COMMAND test_matmul
-    COMMAND test_layernorm
-    COMMAND test_softmax
-    DEPENDS test_matmul test_layernorm test_softmax
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running all correctness tests"
-)
-
-# ── CUDA compiler flags ────────────────────────────────────────────────────────
-# --use_fast_math : enables hardware intrinsics (rsqrtf, expf, etc.)
-# -O3             : maximum host-side optimisation
-# -lineinfo       : preserves source line info for Nsight Compute
-# --ptxas-options=-v : prints register/smem usage per kernel
-target_compile_options(cuda_kernels_lib PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-        --use_fast_math
-        -O3
-        -lineinfo
-        --ptxas-options=-v
-    >
-)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_analysis COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_analysis.py")
+endif()

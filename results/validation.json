@@ -1,0 +1,84 @@
+{
+  "verified_date": "2026-10-07",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU",
+    "compute_capability": "12.0",
+    "cuda_runtime": 13010,
+    "cuda_driver_api": 13010,
+    "vendor_norm": "cuDNN 91701",
+    "precision": "FP32 (cuBLAS pedantic math)",
+    "protocol": "CUDA graph replay; cached-buffer steady-state GPU time; setup/transfers excluded",
+    "trials": 5,
+    "samples_per_trial": 50,
+    "warmup_iterations": 20,
+    "max_launches_per_sample": 64,
+    "input_seeds": [
+      1,
+      2,
+      11,
+      12,
+      13
+    ]
+  },
+  "ctest_suites_passed": 5,
+  "analyzer_regression_cases": 5,
+  "aggregate_records": 104,
+  "trial_records": 520,
+  "memcheck_errors": 0,
+  "racecheck_errors": 0,
+  "racecheck_warnings": 0,
+  "legacy_main_exit_code": 0,
+  "full_workflow_exit_code": 0,
+  "vendor_wins": [
+    {
+      "operator": "LayerNorm",
+      "shape": "128x768",
+      "kernel": "Dispatcher",
+      "vendor": "cuDNN",
+      "speedup": 1.25324,
+      "minimum_trial_speedup": 1.19745
+    },
+    {
+      "operator": "MatMul",
+      "shape": "128x64x128",
+      "kernel": "Tiled32(V2)",
+      "vendor": "cuBLAS",
+      "speedup": 1.57948,
+      "minimum_trial_speedup": 1.44219
+    },
+    {
+      "operator": "Softmax",
+      "shape": "12288x1024",
+      "kernel": "Shape",
+      "vendor": "cuDNN",
+      "speedup": 1.44284,
+      "minimum_trial_speedup": 1.41997
+    }
+  ],
+  "aggregate_csv_sha256": "3f1c322417bdb3f446584a4fad7226236ae53df6c02441569fe0ce564b66535b",
+  "source_sha256": {
+    "CMakeLists.txt": "63e50a3f723f949419405cbd0c12df77a6d006f2291776007eb83d1a55a971c5",
+    "include/benchmark.cuh": "12e3729fa5aabaac4e2526b827d9f88c6c76732adfeebfab08e1d50a0059c49f",
+    "include/cuda_utils.cuh": "641a4981fa62003516dae86ad91fc632444d973b51a24918b1a641984193a871",
+    "include/kernel_dispatcher.cuh": "c699908c718ba617b6f1a58b0451396bbb3ca78c26ebd6cabe17d15ca053713e",
+    "include/layernorm.cuh": "ad800fbefaf1a088eeeddbe0cbb3da68370f61811fcf572215fccacb38d0623d",
+    "include/matmul.cuh": "1793da05e2c5ecc11b08d13d13f2198207447b7df963c19880444464f489a54d",
+    "include/shape_kernels.cuh": "2c1c18b9cda75c03619108e313b4dffdcbabb95ccba2514d42ec83d398fbb3d9",
+    "include/softmax.cuh": "80add453163addc109a0b8020a87383869c874a2f2a689ba3863e5a444a2eab3",
+    "include/validation.cuh": "db6749fa93665a40440b4e25fefa994c4596e8d534a5b788c67004a9d10909de",
+    "include/vendor_baselines.h": "bf0dae03bad48cc11239164443af807d89e465e697dfb497394d4850806aafa5",
+    "scripts/analyze_results.py": "bf29d4f297e1b0ac813910dec237438dc2de2be8318501ccee3ee706e9abc24c",
+    "src/kernel_dispatcher.cu": "248c5b2fd3e6eeacd2405d8475248994c4bb70ecd3373b1a2140e2b0b4647cd0",
+    "src/layernorm.cu": "6c667fdab996cd7a2a2f56654a8152a4ededb9b4115f11de50249ab5c16512ac",
+    "src/main.cu": "0dd8c376ba0f66a578028d125e947f4d93fa6632f5feabcad771702ec4797fd6",
+    "src/matmul.cu": "61e6764b20c1d2119b72efd4881e99eb575f42230fddb45cbb896da872998401",
+    "src/shape_kernels.cu": "09986ec3f5e25612b54b9cd4c2d984b7041cf06b61b35f962dfd16f59a981480",
+    "src/softmax.cu": "d07a6538ff2872910ec713edf8beaf1a727d36630a2b123567484e5dd83d0a6e",
+    "src/vendor_baselines.cpp": "8c566cddf7028752b36b9bc6de5bfff107668cc92d625952b05c7be303d6a612",
+    "tests/test_analysis.py": "ec571530b32d622e19f9328dfed1fea2e7498b17cae160a066de31118689645b",
+    "tests/test_edge_cases.cu": "c807ce613d9ea7c5f10c291ad252fb0b9ae1efdbe8e0ebb85f60a36ed240b26c",
+    "tests/test_layernorm.cu": "01ed0718435b796b8d5352a082415404b5bd0e31dc9fdacdca6d3f76b4110cad",
+    "tests/test_matmul.cu": "e17f402de520e729789c5fed25c3bf78f723ee80e2f18320ea9348fcf85fc61e",
+    "tests/test_softmax.cu": "c193aed695c5fcd9f4a4018bf32e7ec014cd9148e2db298c25d81ee44ced5316"
+  }
+}

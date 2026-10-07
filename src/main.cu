@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <stdexcept>
 // =============================================================================
 // main.cu — CUDA Kernel Library: Main Driver
 // Orchestrates: GPU info → correctness tests → benchmarks → CSV output
@@ -88,7 +90,7 @@ static void run_matmul_suite(cublasHandle_t cublas,
     auto verify = [&](const char* name) {
         if (!do_cpu_ref) return;
         device_to_host(hC_gpu.data(), d_C, sC);
-        check_correctness(hC_ref.data(), hC_gpu.data(), sC, 1e-3f, name);
+        if (!check_correctness(hC_ref.data(), hC_gpu.data(), sC, 1e-3f, name).passed) throw std::runtime_error("MatMul correctness failed");
     };
 
     // V1 — Naive
@@ -182,7 +184,7 @@ static void run_layernorm_suite(FILE* csv, int batch, int hidden)
 
     auto verify = [&](const char* name) {
         device_to_host(hy_gpu.data(), d_y, n);
-        check_correctness(hy_ref.data(), hy_gpu.data(), n, 1e-4f, name);
+        if (!check_correctness(hy_ref.data(), hy_gpu.data(), n, 1e-4f, name).passed) throw std::runtime_error("LayerNorm correctness failed");
     };
 
     auto bench_v = [&](int v) {
@@ -237,6 +239,7 @@ static void run_softmax_suite(FILE* csv, int batch, int cols)
     auto verify = [&](const char* name) {
         device_to_host(hy_gpu.data(), d_y, n);
         auto res = check_correctness(hy_ref.data(), hy_gpu.data(), n, 1e-4f, name);
+        if (!res.passed) throw std::runtime_error("Softmax correctness failed");
 
         // Also verify row sums ≈ 1.0
         float max_row_sum_err = 0.f;
@@ -283,6 +286,7 @@ static void run_softmax_suite(FILE* csv, int batch, int cols)
 // =============================================================================
 int main(int argc, char** argv)
 {
+    try {
     // Phase 1: GPU info
     section("Phase 1 — GPU Environment");
     cuda_init_check();
@@ -294,6 +298,7 @@ int main(int argc, char** argv)
     CUBLAS_CHECK(cublasCreate(&cublas));
 
     // CSV output
+    std::filesystem::create_directories("results");
     FILE* csv = fopen("results/benchmark_results.csv", "w");
     if (!csv) {
         fprintf(stderr, "Warning: cannot open results/benchmark_results.csv\n");
@@ -339,7 +344,7 @@ int main(int argc, char** argv)
 
     // ── Phase 14: Auto-tuning demo ─────────────────────────────────────────
     section("Phase 14 — Auto-Tuning Demo");
-    cuda_kernels::autotune_matmul(1024, 1024, 1024);
+    cuda_kernels::autotune_matmul(1024, 1024, 1024, cublas);
     cuda_kernels::autotune_layernorm(128, 4096);
     cuda_kernels::autotune_softmax(128, 4096);
 
@@ -348,8 +353,11 @@ int main(int argc, char** argv)
     {
         int M = 1024, K = 1024, N = 1024;
         float* d_A = device_alloc<float>((size_t)M * K);
+        CUDA_CHECK(cudaMemset(d_A,0,((size_t)M * K)*sizeof(float)));
         float* d_B = device_alloc<float>((size_t)K * N);
+        CUDA_CHECK(cudaMemset(d_B,0,((size_t)K * N)*sizeof(float)));
         float* d_C = device_alloc<float>((size_t)M * N);
+        CUDA_CHECK(cudaMemset(d_C,0,((size_t)M * N)*sizeof(float)));
         printf("  cuda_kernels::matmul(%d×%d×%d) dispatched to best kernel.\n", M, K, N);
         cuda_kernels::matmul(d_A, d_B, d_C, M, K, N, cublas);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -357,16 +365,22 @@ int main(int argc, char** argv)
 
         int B = 128, H = 4096;
         float* dx = device_alloc<float>((size_t)B * H);
+        CUDA_CHECK(cudaMemset(dx,0,((size_t)B * H)*sizeof(float)));
         float* dg = device_alloc<float>(H);
+        CUDA_CHECK(cudaMemset(dg,0,(H)*sizeof(float)));
         float* db = device_alloc<float>(H);
+        CUDA_CHECK(cudaMemset(db,0,(H)*sizeof(float)));
         float* dy = device_alloc<float>((size_t)B * H);
+        CUDA_CHECK(cudaMemset(dy,0,((size_t)B * H)*sizeof(float)));
         printf("  cuda_kernels::layernorm(%d×%d) dispatched.\n", B, H);
         cuda_kernels::layernorm(dx, dg, db, dy, B, H);
         CUDA_CHECK(cudaDeviceSynchronize());
         device_free(dx); device_free(dg); device_free(db); device_free(dy);
 
         float* sx = device_alloc<float>((size_t)B * H);
+        CUDA_CHECK(cudaMemset(sx,0,((size_t)B * H)*sizeof(float)));
         float* sy = device_alloc<float>((size_t)B * H);
+        CUDA_CHECK(cudaMemset(sy,0,((size_t)B * H)*sizeof(float)));
         printf("  cuda_kernels::softmax(%d×%d) dispatched.\n", B, H);
         cuda_kernels::softmax(sx, sy, B, H);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -380,4 +394,5 @@ int main(int argc, char** argv)
     CUBLAS_CHECK(cublasDestroy(cublas));
     CUDA_CHECK(cudaDeviceReset());
     return 0;
+    } catch (const std::exception& e) { fprintf(stderr,"[ERROR] %s\n",e.what()); return 1; }
 }

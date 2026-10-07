@@ -1,0 +1,14 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU",
+  "compute_capability": "12.0",
+  "cuda_runtime": 13010,
+  "cuda_driver_api": 13010,
+  "vendor_norm": "cuDNN 91701",
+  "precision": "FP32 (cuBLAS pedantic math)",
+  "protocol": "CUDA graph replay; cached-buffer steady-state GPU time; setup/transfers excluded",
+  "trials": 1,
+  "samples_per_trial": 1,
+  "warmup_iterations": 20,
+  "max_launches_per_sample": 64,
+  "input_seeds": [1,2,11,12,13]
+}

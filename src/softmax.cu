@@ -1,3 +1,4 @@
+#include "validation.cuh"
 // =============================================================================
 // softmax.cu — Softmax Kernel Implementations
 // Phase 8: V1→V4
@@ -102,9 +103,11 @@ void kernel_softmax_v1(const float* __restrict__ x,
 
 void launch_softmax_v1(const float* d_x, float* d_y, int batch, int cols)
 {
+    validate_softmax(d_x,d_y,batch,cols); if (!batch) return;
+
     int threads = 256;
     size_t smem = threads * sizeof(float);
-    kernel_softmax_v1<<<batch, threads, smem>>>(d_x, d_y, cols);
+    kernel_softmax_v1<<<batch, threads, smem, execution_stream()>>>(d_x, d_y, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -164,10 +167,12 @@ void kernel_softmax_v2(const float* __restrict__ x,
 
 void launch_softmax_v2(const float* d_x, float* d_y, int batch, int cols)
 {
+    validate_softmax(d_x,d_y,batch,cols); if (!batch) return;
+
     int threads   = 256;
     int num_warps = threads / 32;
     size_t smem   = fmaxf(threads, num_warps) * sizeof(float);
-    kernel_softmax_v2<<<batch, threads, smem>>>(d_x, d_y, cols);
+    kernel_softmax_v2<<<batch, threads, smem, execution_stream()>>>(d_x, d_y, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -219,6 +224,7 @@ void kernel_softmax_v3(const float* __restrict__ x,
     for (int i = tid; i < cols; i += blockDim.x)
         lmax = fmaxf(lmax, xrow[i]);
     float mx = block_max(lmax);
+    __syncthreads();
 
     // Exp + sum
     float lsum = 0.f;
@@ -236,10 +242,12 @@ void kernel_softmax_v3(const float* __restrict__ x,
 
 void launch_softmax_v3(const float* d_x, float* d_y, int batch, int cols)
 {
+    validate_softmax(d_x,d_y,batch,cols); if (!batch) return;
+
     int threads   = 256;
     int num_warps = threads / 32;
     size_t smem   = num_warps * sizeof(float);
-    kernel_softmax_v3<<<batch, threads, smem>>>(d_x, d_y, cols);
+    kernel_softmax_v3<<<batch, threads, smem, execution_stream()>>>(d_x, d_y, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -357,9 +365,12 @@ void kernel_softmax_v4(const float* __restrict__ x,
 
 void launch_softmax_v4(const float* d_x, float* d_y, int batch, int cols)
 {
+    validate_softmax(d_x,d_y,batch,cols); if (!batch) return;
+    if (cols%4 || !aligned16(d_x) || !aligned16(d_y)) { launch_softmax_v3(d_x,d_y,batch,cols); return; }
+
     int threads   = 256;
     int num_warps = threads / 32;
     size_t smem   = 2 * num_warps * sizeof(float);
-    kernel_softmax_v4<<<batch, threads, smem>>>(d_x, d_y, cols);
+    kernel_softmax_v4<<<batch, threads, smem, execution_stream()>>>(d_x, d_y, cols);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -1,3 +1,4 @@
+#include "validation.cuh"
 // =============================================================================
 // layernorm.cu — Layer Normalization Kernel Implementations
 // Phase 7: V1→V4
@@ -100,9 +101,11 @@ void launch_layernorm_v1(const float* d_x, const float* d_gamma,
                           const float* d_beta, float* d_y,
                           int batch, int hidden, float eps)
 {
+    validate_layernorm(d_x,d_gamma,d_beta,d_y,batch,hidden,eps); if (!batch) return;
+
     int threads = 256;
     size_t smem = threads * sizeof(float);
-    kernel_layernorm_v1<<<batch, threads, smem>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
+    kernel_layernorm_v1<<<batch, threads, smem, execution_stream()>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -150,6 +153,7 @@ void kernel_layernorm_v2(const float* __restrict__ x,
     }
     __syncthreads();
     float mean = smem[0];
+    __syncthreads();
 
     // ── Variance ─────────────────────────────────────────────────────────
     float local_var = 0.f;
@@ -178,10 +182,12 @@ void launch_layernorm_v2(const float* d_x, const float* d_gamma,
                           const float* d_beta, float* d_y,
                           int batch, int hidden, float eps)
 {
+    validate_layernorm(d_x,d_gamma,d_beta,d_y,batch,hidden,eps); if (!batch) return;
+
     int threads   = 256;
     int num_warps = threads / 32;
     size_t smem   = num_warps * sizeof(float);
-    kernel_layernorm_v2<<<batch, threads, smem>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
+    kernel_layernorm_v2<<<batch, threads, smem, execution_stream()>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -226,6 +232,7 @@ void kernel_layernorm_v3(const float* __restrict__ x,
     float s = 0.f;
     for (int i = tid; i < hidden; i += blockDim.x) s += xrow[i];
     float mean = block_reduce(s) / hidden;
+    __syncthreads();
 
     // ── Variance ──────────────────────────────────────────────────────────
     float v = 0.f;
@@ -243,10 +250,12 @@ void launch_layernorm_v3(const float* d_x, const float* d_gamma,
                           const float* d_beta, float* d_y,
                           int batch, int hidden, float eps)
 {
+    validate_layernorm(d_x,d_gamma,d_beta,d_y,batch,hidden,eps); if (!batch) return;
+
     int threads   = 256;
     int num_warps = threads / 32;
     size_t smem   = num_warps * sizeof(float);
-    kernel_layernorm_v3<<<batch, threads, smem>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
+    kernel_layernorm_v3<<<batch, threads, smem, execution_stream()>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -383,10 +392,13 @@ void launch_layernorm_v4(const float* d_x, const float* d_gamma,
                           const float* d_beta, float* d_y,
                           int batch, int hidden, float eps)
 {
+    validate_layernorm(d_x,d_gamma,d_beta,d_y,batch,hidden,eps); if (!batch) return;
+    if (hidden%4 || !aligned16(d_x) || !aligned16(d_gamma) || !aligned16(d_beta) || !aligned16(d_y)) { launch_layernorm_v3(d_x,d_gamma,d_beta,d_y,batch,hidden,eps); return; }
+
     int threads   = 256;
     int num_warps = threads / 32;
     // smem: mean[num_warps] + M2[num_warps] + n[num_warps as int]
     size_t smem = (2 * num_warps) * sizeof(float) + num_warps * sizeof(int);
-    kernel_layernorm_v4<<<batch, threads, smem>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
+    kernel_layernorm_v4<<<batch, threads, smem, execution_stream()>>>(d_x, d_gamma, d_beta, d_y, hidden, eps);
     CUDA_CHECK(cudaGetLastError());
 }

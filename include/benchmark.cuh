@@ -1,158 +1,99 @@
-// =============================================================================
-// benchmark.cuh — Reusable CUDA Benchmark Framework
-// Phase 10: Benchmark Framework
-// =============================================================================
 #pragma once
-
 #include "cuda_utils.cuh"
-#include <vector>
 #include <algorithm>
-#include <numeric>
-#include <functional>
-#include <string>
-#include <cstdio>
 #include <cmath>
+#include <cstdio>
+#include <functional>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-// -----------------------------------------------------------------------------
-// BenchmarkConfig — controls warm-up and measurement iterations
-// -----------------------------------------------------------------------------
 struct BenchmarkConfig {
-    int warmup_iters  = 20;   // warm-up runs (not timed)
-    int bench_iters   = 100;  // measured runs
-    bool verbose      = true;
+    int warmup_iters=20, bench_iters=100;
+    bool verbose=true;
+    int max_launches_per_sample=64;
+    bool use_cuda_graph=true;
 };
-
-// -----------------------------------------------------------------------------
-// BenchmarkResult — returned for every benchmark run
-// -----------------------------------------------------------------------------
 struct BenchmarkResult {
     std::string name;
-    float avg_ms   = 0.f;
-    float min_ms   = 0.f;
-    float med_ms   = 0.f;
-    float max_ms   = 0.f;
-    float tflops   = 0.f;   // for matmul
-    double gflops_total = 0.0; // raw FLOPs / time
+    float avg_ms=0,min_ms=0,med_ms=0,max_ms=0,tflops=0;
+    double gflops_total=0;
+    int launches_per_sample=1;
 };
-
-// -----------------------------------------------------------------------------
-// Core benchmark runner
-// Accepts any callable: void kernel_fn()  (captures everything by reference)
-// -----------------------------------------------------------------------------
-inline BenchmarkResult run_benchmark(
-        const std::string& name,
-        std::function<void()> kernel_fn,
-        const BenchmarkConfig& cfg = BenchmarkConfig(),
-        double flops = 0.0)
-{
-    CudaTimer timer;
-    std::vector<float> times;
-    times.reserve(cfg.bench_iters);
-
-    // ── Warm-up ─────────────────────────────────────────────────────────────
-    for (int i = 0; i < cfg.warmup_iters; ++i) {
-        kernel_fn();
+inline BenchmarkResult run_benchmark(const std::string& name,std::function<void()> fn,
+                                     const BenchmarkConfig& cfg=BenchmarkConfig(),double flops=0) {
+    if(cfg.warmup_iters<0||cfg.bench_iters<1||cfg.max_launches_per_sample<1)
+        throw std::invalid_argument("Invalid benchmark iteration count.");
+    cudaStream_t stream;CUDA_CHECK(cudaStreamCreate(&stream));
+    cudaStream_t previous=execution_stream();set_execution_stream(stream);
+    cudaGraph_t graph=nullptr;cudaGraphExec_t executable=nullptr;
+    try {
+        CudaTimer timer;
+        for(int i=0;i<cfg.warmup_iters;++i)fn();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        timer.begin();fn();timer.end();
+        float pilot=timer.elapsed_ms();
+        int repeats=std::max(1,std::min(cfg.max_launches_per_sample,(int)std::ceil(0.3f/std::max(pilot,0.0001f))));
+        if(cfg.use_cuda_graph) {
+            CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+            for(int i=0;i<repeats;++i)fn();
+            CUDA_CHECK(cudaStreamEndCapture(stream,&graph));
+            CUDA_CHECK(cudaGraphInstantiate(&executable,graph,0));
+            CUDA_CHECK(cudaGraphLaunch(executable,stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        std::vector<float> times;times.reserve(cfg.bench_iters);
+        for(int i=0;i<cfg.bench_iters;++i) {
+            timer.begin();
+            if(executable)CUDA_CHECK(cudaGraphLaunch(executable,stream));
+            else for(int j=0;j<repeats;++j)fn();
+            timer.end();times.push_back(timer.elapsed_ms()/repeats);
+        }
+        std::sort(times.begin(),times.end());
+        BenchmarkResult r;
+        r.name=name;r.avg_ms=std::accumulate(times.begin(),times.end(),0.f)/times.size();
+        r.min_ms=times.front();r.max_ms=times.back();
+        size_t mid=times.size()/2;r.med_ms=times.size()%2?times[mid]:(times[mid-1]+times[mid])/2;
+        r.launches_per_sample=repeats;
+        if(flops>0){r.tflops=(float)(flops/(r.avg_ms*1e9));r.gflops_total=flops/1e9;}
+        if(cfg.verbose)printf("  %-26s avg=%9.6f ms min=%9.6f med=%9.6f TFLOPS=%.3f (%d launches/sample)\n",
+                              name.c_str(),r.avg_ms,r.min_ms,r.med_ms,r.tflops,repeats);
+        if(executable)CUDA_CHECK(cudaGraphExecDestroy(executable));
+        if(graph)CUDA_CHECK(cudaGraphDestroy(graph));
+        set_execution_stream(previous);CUDA_CHECK(cudaStreamDestroy(stream));
+        return r;
+    }catch(...){
+        cudaStreamCaptureStatus status;cudaStreamIsCapturing(stream,&status);
+        if(status!=cudaStreamCaptureStatusNone){cudaGraph_t invalid=nullptr;cudaStreamEndCapture(stream,&invalid);if(invalid)cudaGraphDestroy(invalid);}
+        if(executable)cudaGraphExecDestroy(executable);if(graph)cudaGraphDestroy(graph);
+        set_execution_stream(previous);cudaStreamDestroy(stream);throw;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ── Timed iterations ─────────────────────────────────────────────────────
-    for (int i = 0; i < cfg.bench_iters; ++i) {
-        timer.begin();
-        kernel_fn();
-        timer.end();
-        times.push_back(timer.elapsed_ms());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ── Statistics ───────────────────────────────────────────────────────────
-    std::sort(times.begin(), times.end());
-    float avg = std::accumulate(times.begin(), times.end(), 0.f) / times.size();
-    float mn  = times.front();
-    float med = times[times.size() / 2];
-    float mx  = times.back();
-
-    BenchmarkResult r;
-    r.name   = name;
-    r.avg_ms = avg;
-    r.min_ms = mn;
-    r.med_ms = med;
-    r.max_ms = mx;
-
-    if (flops > 0.0) {
-        // TFLOPS = FLOPs / (time_s * 1e12)
-        double time_s = avg / 1000.0;
-        r.tflops       = (float)(flops / (time_s * 1e12));
-        r.gflops_total = flops / 1e9;
-    }
-
-    if (cfg.verbose) {
-        printf("  %-40s  avg=%7.3f ms  min=%7.3f ms  med=%7.3f ms",
-               name.c_str(), avg, mn, med);
-        if (flops > 0.0) printf("  %.3f TFLOPS", r.tflops);
-        printf("\n");
-    }
-    return r;
 }
-
-// -----------------------------------------------------------------------------
-// Correctness checker (CPU vs GPU)
-// -----------------------------------------------------------------------------
-struct CorrectnessResult {
-    bool   passed;
-    float  max_abs_err;
-    float  max_rel_err;
-    double avg_abs_err;
-};
-
-inline CorrectnessResult check_correctness(
-        const float* ref,       // CPU reference output
-        const float* gpu,       // GPU result (host buffer)
-        size_t       n,
-        float        abs_tol = 1e-4f,
-        const char*  op_name = "operator")
-{
-    float  max_abs = 0.f, max_rel = 0.f;
-    double sum_abs = 0.0;
-
-    for (size_t i = 0; i < n; ++i) {
-        float diff = fabsf(ref[i] - gpu[i]);
-        float rel  = (fabsf(ref[i]) > 1e-8f) ? diff / fabsf(ref[i]) : diff;
-        max_abs = fmaxf(max_abs, diff);
-        max_rel = fmaxf(max_rel, rel);
-        sum_abs += diff;
+struct CorrectnessResult {bool passed;float max_abs_err,max_rel_err;double avg_abs_err;};
+inline CorrectnessResult check_correctness(const float* ref,const float* gpu,size_t n,
+                                           float abs_tol=1e-4f,const char* op="operator",float rel_tol=0.f) {
+    if(!n||!ref||!gpu||abs_tol<0||rel_tol<0)throw std::invalid_argument("Invalid correctness check.");
+    float max_abs=0,max_rel=0;double sum=0;bool passed=true;
+    for(size_t i=0;i<n;++i) {
+        if(!std::isfinite(ref[i])||!std::isfinite(gpu[i])) {
+            passed=false;max_abs=INFINITY;max_rel=INFINITY;sum=INFINITY;continue;
+        }
+        float diff=std::abs(ref[i]-gpu[i]),rel=diff/std::max(std::abs(ref[i]),1e-8f);
+        max_abs=std::max(max_abs,diff);max_rel=std::max(max_rel,rel);sum+=diff;
+        if(diff>abs_tol+rel_tol*std::abs(ref[i]))passed=false;
     }
-    bool passed = (max_abs <= abs_tol);
-
-    printf("  Correctness %-12s : %s  (max_abs=%.2e, avg_abs=%.2e, tol=%.2e)\n",
-           op_name,
-           passed ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m",
-           max_abs, sum_abs / n, abs_tol);
-
-    return { passed, max_abs, max_rel, sum_abs / (double)n };
+    printf("  Correctness %-20s %s (max_abs=%.3e avg_abs=%.3e abs_tol=%.1e rel_tol=%.1e)\n",
+            op,passed?"PASS":"FAIL",max_abs,sum/n,abs_tol,rel_tol);
+    return {passed,max_abs,max_rel,sum/n};
 }
-
-// -----------------------------------------------------------------------------
-// Print comparison table row (speedup between two results)
-// -----------------------------------------------------------------------------
-inline void print_speedup(const BenchmarkResult& baseline,
-                           const BenchmarkResult& optimized) {
-    float speedup = baseline.avg_ms / optimized.avg_ms;
-    printf("  Speedup  %-20s → %-20s : %.2f×\n",
-           baseline.name.c_str(), optimized.name.c_str(), speedup);
+inline void print_speedup(const BenchmarkResult& baseline,const BenchmarkResult& optimized) {
+    printf("  Speedup %s -> %s: %.3fx\n",baseline.name.c_str(),optimized.name.c_str(),baseline.avg_ms/optimized.avg_ms);
 }
-
-// -----------------------------------------------------------------------------
-// CSV writer
-// -----------------------------------------------------------------------------
 inline void write_csv_header(FILE* f) {
-    fprintf(f, "operator,shape,kernel,avg_ms,min_ms,med_ms,tflops,speedup_vs_naive\n");
+    fprintf(f,"operator,shape,kernel,avg_ms,min_ms,med_ms,tflops,speedup_vs_naive\n");
 }
-
-inline void write_csv_row(FILE* f,
-                           const char* op, const char* shape,
-                           const BenchmarkResult& r,
-                           float speedup_vs_naive = 1.f) {
-    fprintf(f, "%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-            op, shape, r.name.c_str(),
-            r.avg_ms, r.min_ms, r.med_ms, r.tflops, speedup_vs_naive);
+inline void write_csv_row(FILE* f,const char* op,const char* shape,const BenchmarkResult& r,float speedup=1.f) {
+    fprintf(f,"%s,%s,%s,%.8f,%.8f,%.8f,%.5f,%.5f\n",op,shape,r.name.c_str(),
+            r.avg_ms,r.min_ms,r.med_ms,r.tflops,speedup);
 }

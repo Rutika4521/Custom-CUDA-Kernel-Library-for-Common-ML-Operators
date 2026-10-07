@@ -46,3 +46,11 @@ profile_out/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Local SDK downloads and edit backup
+third_party/
+.codex-backup/
+
+*.ncu-repz
+!results/target_results.csv
+!results/target_results.trials.csv

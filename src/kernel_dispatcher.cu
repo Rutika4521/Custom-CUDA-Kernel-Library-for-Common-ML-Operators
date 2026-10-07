@@ -1,251 +1,132 @@
-// =============================================================================
-// kernel_dispatcher.cu — Shape-Aware Kernel Dispatcher (Phases 13, 14, 15)
-// =============================================================================
-
 #include "kernel_dispatcher.cuh"
 #include "matmul.cuh"
 #include "layernorm.cuh"
 #include "softmax.cuh"
+#include "shape_kernels.cuh"
 #include "benchmark.cuh"
-#include "cuda_utils.cuh"
+#include "validation.cuh"
+#include <mutex>
+#include <cstring>
+#include <random>
 #include <unordered_map>
-#include <string>
-#include <cstdio>
-#include <algorithm>
-
+#include <vector>
 namespace cuda_kernels {
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal tuning caches
-// Key: "M_K_N" or "B_H" or "B_C"
-// ─────────────────────────────────────────────────────────────────────────────
-
-static std::unordered_map<std::string, int> matmul_tune_cache;
-static std::unordered_map<std::string, int> layernorm_tune_cache;
-static std::unordered_map<std::string, int> softmax_tune_cache;
-
-static inline std::string matmul_key(int M, int K, int N) {
-    return std::to_string(M) + "_" + std::to_string(K) + "_" + std::to_string(N);
+namespace {
+std::mutex cache_mutex;
+std::unordered_map<std::string,int> cache;
+std::string key(const char* op,int a,int b,int c=0) {
+    int device=0;CUDA_CHECK(cudaGetDevice(&device));
+    return std::string(op)+":"+std::to_string(device)+":"+std::to_string(a)+":"+std::to_string(b)+":"+std::to_string(c);
 }
-static inline std::string ln_key(int B, int H) {
-    return std::to_string(B) + "_" + std::to_string(H);
+std::string eps_key(float e){uint32_t bits;std::memcpy(&bits,&e,sizeof(bits));return std::to_string(bits);}
+int lookup(const std::string& k,int fallback){
+    std::lock_guard<std::mutex> guard(cache_mutex);auto i=cache.find(k);return i==cache.end()?fallback:i->second;
 }
-static inline std::string sm_key(int B, int C) {
-    return std::to_string(B) + "_" + std::to_string(C);
+void save(const std::string& k,int v){std::lock_guard<std::mutex>guard(cache_mutex);cache[k]=v;}
+struct Buffer {
+    float* p;
+    explicit Buffer(const std::vector<float>&v):p(device_alloc_and_copy(v.data(),v.size())){}
+    explicit Buffer(size_t n):p(device_alloc<float>(n)){}
+    ~Buffer(){device_free(p);}
+};
+std::vector<float> data(size_t n,unsigned seed,float scale=0.5f){
+    std::mt19937 rng(seed);std::uniform_real_distribution<float>d(-scale,scale);std::vector<float>v(n);
+    for(float&x:v)x=d(rng);return v;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MatMul dispatcher
-// Heuristic rules (can be overridden by auto-tune):
-//   Large square (>= 2048):  V4 (32-tile + unrolled)
-//   Medium (>= 512):         V2<32> (tiled SMEM)
-//   Small:                   V1 (naive, avoids block-size waste)
-// ─────────────────────────────────────────────────────────────────────────────
-void matmul(const float* d_A, const float* d_B, float* d_C,
-            int M, int K, int N, cublasHandle_t cublas_handle)
-{
-    std::string key = matmul_key(M, K, N);
-    int version = 0;
-
-    auto it = matmul_tune_cache.find(key);
-    if (it != matmul_tune_cache.end()) {
-        version = it->second;
-    } else {
-        // Shape-based heuristic selection
-        long long size = (long long)M * K * N;
-        if (size >= (long long)2048 * 2048 * 2048) {
-            version = (cublas_handle ? 5 : 4);  // prefer cuBLAS for huge shapes
-        } else if (M >= 512 && N >= 512) {
-            version = 4;    // vectorized tiled
-        } else if (M >= 128 && N >= 128) {
-            version = 2;    // shared-mem tiled
-        } else {
-            version = 1;    // naive (small shapes have little to gain)
-        }
-    }
-
-    switch (version) {
-        case 1: launch_matmul_v1(d_A, d_B, d_C, M, K, N); break;
-        case 2: launch_matmul_v2<32>(d_A, d_B, d_C, M, K, N); break;
-        case 3: launch_matmul_v3(d_A, d_B, d_C, M, K, N); break;
-        case 4: launch_matmul_v4(d_A, d_B, d_C, M, K, N); break;
-        case 5:
-            if (cublas_handle)
-                launch_matmul_cublas(cublas_handle, d_A, d_B, d_C, M, K, N);
-            else
-                launch_matmul_v4(d_A, d_B, d_C, M, K, N);
-            break;
-        default: launch_matmul_v2<32>(d_A, d_B, d_C, M, K, N); break;
+void mm(int v,const float*a,const float*b,float*c,int m,int k,int n,cublasHandle_t handle){
+    switch(v){
+    case 1:launch_matmul_v1(a,b,c,m,k,n);break;
+    case 2:launch_matmul_v2<32>(a,b,c,m,k,n);break;
+    case 3:launch_matmul_v3(a,b,c,m,k,n);break;
+    case 4:launch_matmul_v4(a,b,c,m,k,n);break;
+    case 5:if(handle){launch_matmul_cublas(handle,a,b,c,m,k,n);break;}[[fallthrough]];
+    case 6:launch_matmul_shape(a,b,c,m,k,n);break;
+    case 7:launch_matmul_v2<16>(a,b,c,m,k,n);break;
+    default:
+        if(v>=100&&v<100+MATMUL_CONFIG_COUNT){launch_matmul_config(v-100,a,b,c,m,k,n);break;}
+        throw std::logic_error("Invalid cached MatMul version");
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LayerNorm dispatcher
-// hidden < 1024: V3 (warp primitives, fewer threads needed)
-// hidden >= 1024 and multiple of 4: V4 (vectorized + Welford)
-// otherwise: V2 (reliable warp-aligned reduction)
-// ─────────────────────────────────────────────────────────────────────────────
-void layernorm(const float* d_x, const float* d_gamma, const float* d_beta,
-               float* d_y, int batch, int hidden, float eps)
-{
-    std::string key = ln_key(batch, hidden);
-    int version = 0;
-
-    auto it = layernorm_tune_cache.find(key);
-    if (it != layernorm_tune_cache.end()) {
-        version = it->second;
-    } else {
-        if (hidden % 4 == 0 && hidden >= 1024)
-            version = 4;
-        else if (hidden >= 512)
-            version = 3;
-        else
-            version = 2;
-    }
-
-    switch (version) {
-        case 1: launch_layernorm_v1(d_x, d_gamma, d_beta, d_y, batch, hidden, eps); break;
-        case 2: launch_layernorm_v2(d_x, d_gamma, d_beta, d_y, batch, hidden, eps); break;
-        case 3: launch_layernorm_v3(d_x, d_gamma, d_beta, d_y, batch, hidden, eps); break;
-        case 4: launch_layernorm_v4(d_x, d_gamma, d_beta, d_y, batch, hidden, eps); break;
-        default: launch_layernorm_v4(d_x, d_gamma, d_beta, d_y, batch, hidden, eps); break;
+void ln(int v,const float*x,const float*g,const float*b,float*y,int r,int h,float eps){
+    switch(v){
+    case 1:launch_layernorm_v1(x,g,b,y,r,h,eps);break;
+    case 2:launch_layernorm_v2(x,g,b,y,r,h,eps);break;
+    case 3:launch_layernorm_v3(x,g,b,y,r,h,eps);break;
+    case 4:launch_layernorm_v4(x,g,b,y,r,h,eps);break;
+    case 6:launch_layernorm_shape(x,g,b,y,r,h,eps);break;
+    default:throw std::logic_error("Invalid cached LayerNorm version");
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Softmax dispatcher
-// cols % 4 == 0 and cols >= 512: V4 (online + vectorized)
-// cols >= 128: V3 (warp-level both reductions)
-// else: V1 (shared-mem, reliable)
-// ─────────────────────────────────────────────────────────────────────────────
-void softmax(const float* d_x, float* d_y, int batch, int cols)
-{
-    std::string key = sm_key(batch, cols);
-    int version = 0;
-
-    auto it = softmax_tune_cache.find(key);
-    if (it != softmax_tune_cache.end()) {
-        version = it->second;
-    } else {
-        if (cols % 4 == 0 && cols >= 512)
-            version = 4;
-        else if (cols >= 128)
-            version = 3;
-        else
-            version = 1;
-    }
-
-    switch (version) {
-        case 1: launch_softmax_v1(d_x, d_y, batch, cols); break;
-        case 2: launch_softmax_v2(d_x, d_y, batch, cols); break;
-        case 3: launch_softmax_v3(d_x, d_y, batch, cols); break;
-        case 4: launch_softmax_v4(d_x, d_y, batch, cols); break;
-        default: launch_softmax_v4(d_x, d_y, batch, cols); break;
+void sm(int v,const float*x,float*y,int r,int c){
+    switch(v){
+    case 1:launch_softmax_v1(x,y,r,c);break;
+    case 2:launch_softmax_v2(x,y,r,c);break;
+    case 3:launch_softmax_v3(x,y,r,c);break;
+    case 4:launch_softmax_v4(x,y,r,c);break;
+    case 6:launch_softmax_shape(x,y,r,c);break;
+    default:throw std::logic_error("Invalid cached Softmax version");
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-tuner: MatMul
-// Tries a small subset of kernel versions and caches the fastest one.
-// ─────────────────────────────────────────────────────────────────────────────
-void autotune_matmul(int M, int K, int N)
-{
-    printf("\n[AutoTune] MatMul %d×%d×%d\n", M, K, N);
-    BenchmarkConfig cfg;
-    cfg.warmup_iters = 5;
-    cfg.bench_iters  = 20;
-    cfg.verbose      = false;
-
-    float* d_A = device_alloc<float>((size_t)M * K);
-    float* d_B = device_alloc<float>((size_t)K * N);
-    float* d_C = device_alloc<float>((size_t)M * N);
-
-    struct KV { int ver; float ms; };
-    KV best = { 1, 1e9f };
-
-    auto bench_ver = [&](int ver, auto fn) {
-        auto r = run_benchmark("v" + std::to_string(ver), fn, cfg);
-        printf("  V%d: %.3f ms\n", ver, r.avg_ms);
-        if (r.avg_ms < best.ms) best = { ver, r.avg_ms };
-    };
-
-    bench_ver(1, [&]{ launch_matmul_v1(d_A, d_B, d_C, M, K, N); });
-    bench_ver(2, [&]{ launch_matmul_v2<32>(d_A, d_B, d_C, M, K, N); });
-    bench_ver(3, [&]{ launch_matmul_v3(d_A, d_B, d_C, M, K, N); });
-    bench_ver(4, [&]{ launch_matmul_v4(d_A, d_B, d_C, M, K, N); });
-
-    printf("  → Best: V%d (%.3f ms)\n", best.ver, best.ms);
-    matmul_tune_cache[matmul_key(M, K, N)] = best.ver;
-
-    device_free(d_A); device_free(d_B); device_free(d_C);
-}
-
-void autotune_layernorm(int batch, int hidden)
-{
-    printf("\n[AutoTune] LayerNorm %d×%d\n", batch, hidden);
-    BenchmarkConfig cfg;
-    cfg.warmup_iters = 5;
-    cfg.bench_iters  = 20;
-    cfg.verbose      = false;
-
-    float* d_x = device_alloc<float>((size_t)batch * hidden);
-    float* d_g = device_alloc<float>(hidden);
-    float* d_b = device_alloc<float>(hidden);
-    float* d_y = device_alloc<float>((size_t)batch * hidden);
-
-    struct KV { int ver; float ms; };
-    KV best = { 1, 1e9f };
-
-    for (int ver = 1; ver <= 4; ++ver) {
-        auto fn = [&]{
-            switch(ver) {
-                case 1: launch_layernorm_v1(d_x, d_g, d_b, d_y, batch, hidden); break;
-                case 2: launch_layernorm_v2(d_x, d_g, d_b, d_y, batch, hidden); break;
-                case 3: launch_layernorm_v3(d_x, d_g, d_b, d_y, batch, hidden); break;
-                case 4: launch_layernorm_v4(d_x, d_g, d_b, d_y, batch, hidden); break;
-            }
-        };
-        auto r = run_benchmark("ln_v" + std::to_string(ver), fn, cfg);
-        printf("  V%d: %.3f ms\n", ver, r.avg_ms);
-        if (r.avg_ms < best.ms) best = { ver, r.avg_ms };
+int tune(const std::vector<int>&versions,std::function<void(int)>launch,float*out,const std::vector<float>&ref){
+    BenchmarkConfig cfg;cfg.warmup_iters=10;cfg.bench_iters=30;cfg.verbose=false;
+    std::vector<float>check(ref.size());int best=0;float best_ms=INFINITY;
+    for(int v:versions){
+        CUDA_CHECK(cudaMemset(out,0xff,check.size()*sizeof(float)));launch(v);
+        CUDA_CHECK(cudaDeviceSynchronize());device_to_host(check.data(),out,check.size());
+        if(!check_correctness(ref.data(),check.data(),check.size(),1e-4f,"tuning candidate",1e-4f).passed)continue;
+        std::vector<float> medians;
+        for(int trial=0;trial<3;++trial)medians.push_back(run_benchmark("candidate",[&]{launch(v);},cfg).med_ms);
+        std::sort(medians.begin(),medians.end());float ms=medians[1];
+        printf("  V%d: %.6f ms median of three trials\n",v,ms);
+        if(ms<best_ms){best_ms=ms;best=v;}
     }
-    printf("  → Best: V%d\n", best.ver);
-    layernorm_tune_cache[ln_key(batch, hidden)] = best.ver;
-
-    device_free(d_x); device_free(d_g); device_free(d_b); device_free(d_y);
+    if(!best)throw std::runtime_error("No correct tuning candidate.");
+    printf("  Best: V%d (%.6f ms)\n",best,best_ms);return best;
 }
-
-void autotune_softmax(int batch, int cols)
-{
-    printf("\n[AutoTune] Softmax %d×%d\n", batch, cols);
-    BenchmarkConfig cfg;
-    cfg.warmup_iters = 5;
-    cfg.bench_iters  = 20;
-    cfg.verbose      = false;
-
-    float* d_x = device_alloc<float>((size_t)batch * cols);
-    float* d_y = device_alloc<float>((size_t)batch * cols);
-
-    struct KV { int ver; float ms; };
-    KV best = { 1, 1e9f };
-
-    for (int ver = 1; ver <= 4; ++ver) {
-        auto fn = [&]{
-            switch(ver) {
-                case 1: launch_softmax_v1(d_x, d_y, batch, cols); break;
-                case 2: launch_softmax_v2(d_x, d_y, batch, cols); break;
-                case 3: launch_softmax_v3(d_x, d_y, batch, cols); break;
-                case 4: launch_softmax_v4(d_x, d_y, batch, cols); break;
-            }
-        };
-        auto r = run_benchmark("sm_v" + std::to_string(ver), fn, cfg);
-        printf("  V%d: %.3f ms\n", ver, r.avg_ms);
-        if (r.avg_ms < best.ms) best = { ver, r.avg_ms };
-    }
-    printf("  → Best: V%d\n", best.ver);
-    softmax_tune_cache[sm_key(batch, cols)] = best.ver;
-
-    device_free(d_x); device_free(d_y);
 }
-
-}  // namespace cuda_kernels
+void matmul(const float*a,const float*b,float*c,int m,int k,int n,cublasHandle_t handle){
+    validate_matmul(a,b,c,m,k,n);if(!m)return;
+    std::string id=key(handle?"matmul_vendor":"matmul_custom",m,k,n);
+    int fallback=handle&&(int64_t)m*k*n>=2048ll*2048*2048?5:m<=16?6:3;
+    mm(lookup(id,fallback),a,b,c,m,k,n,handle);
+}
+void layernorm(const float*x,const float*g,const float*b,float*y,int r,int h,float eps){
+    validate_layernorm(x,g,b,y,r,h,eps);if(!r)return;
+    std::string id=key("layernorm",r,h)+":"+eps_key(eps);
+    ln(lookup(id,h<=4096?6:3),x,g,b,y,r,h,eps);
+}
+void softmax(const float*x,float*y,int r,int c){
+    validate_softmax(x,y,r,c);if(!r)return;
+    sm(lookup(key("softmax",r,c),c<=4096?6:3),x,y,r,c);
+}
+void autotune_matmul(int m,int k,int n,cublasHandle_t handle){
+    validate_shape(m,k);validate_shape(k,n);validate_shape(m,n);if(!m)return;
+    printf("[AutoTune] MatMul %dx%dx%d\n",m,k,n);
+    auto a=data((size_t)m*k,1),b=data((size_t)k*n,2);Buffer da(a),db(b),dc((size_t)m*n);
+    cublasHandle_t reference_handle=handle;
+    if(!reference_handle){CUBLAS_CHECK(cublasCreate(&reference_handle));CUBLAS_CHECK(cublasSetMathMode(reference_handle,CUBLAS_PEDANTIC_MATH));}
+    launch_matmul_cublas(reference_handle,da.p,db.p,dc.p,m,k,n);
+    std::vector<float>ref((size_t)m*n);device_to_host(ref.data(),dc.p,ref.size());
+    if(!handle)CUBLAS_CHECK(cublasDestroy(reference_handle));
+    std::vector<int>versions={1,2,3,4,6,7};
+    for(int config=0;config<MATMUL_CONFIG_COUNT;++config)
+        if(matmul_config_supported(config,m))versions.push_back(100+config);
+    if(handle)versions.push_back(5);
+    int best=tune(versions,[&](int v){mm(v,da.p,db.p,dc.p,m,k,n,handle);},dc.p,ref);
+    save(key(handle?"matmul_vendor":"matmul_custom",m,k,n),best);
+}
+void autotune_layernorm(int r,int h){
+    validate_shape(r,h);if(!r)return;printf("[AutoTune] LayerNorm %dx%d\n",r,h);
+    auto x=data((size_t)r*h,3,2.f),g=data(h,4),b=data(h,5);Buffer dx(x),dg(g),db(b),dy((size_t)r*h);
+    std::vector<float>ref((size_t)r*h);cpu_layernorm(x.data(),g.data(),b.data(),ref.data(),r,h);
+    int best=tune({1,2,3,4,6},[&](int v){ln(v,dx.p,dg.p,db.p,dy.p,r,h,1e-5f);},dy.p,ref);
+    save(key("layernorm",r,h)+":"+eps_key(1e-5f),best);
+}
+void autotune_softmax(int r,int c){
+    validate_shape(r,c);if(!r)return;printf("[AutoTune] Softmax %dx%d\n",r,c);
+    auto x=data((size_t)r*c,6,3.f);Buffer dx(x),dy((size_t)r*c);std::vector<float>ref((size_t)r*c);
+    cpu_softmax(x.data(),ref.data(),r,c);
+    int best=tune({1,2,3,4,6},[&](int v){sm(v,dx.p,dy.p,r,c);},dy.p,ref);
+    save(key("softmax",r,c),best);
+}
+}

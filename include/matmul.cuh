@@ -41,8 +41,8 @@ void launch_matmul_v3(const float* d_A, const float* d_B, float* d_C,
                       int M, int K, int N);
 
 // -----------------------------------------------------------------------------
-// Vectorized-load MatMul — V4 (Phase 5)
-// Uses float4 for coalesced 128-bit loads
+// Unrolled tiled MatMul — V4 (Phase 5)
+// Uses scalar tile loads and unrolled multiply-add groups
 // -----------------------------------------------------------------------------
 void launch_matmul_v4(const float* d_A, const float* d_B, float* d_C,
                       int M, int K, int N);

@@ -1,3 +1,4 @@
+#include "validation.cuh"
 // =============================================================================
 // matmul.cu — All MatMul Kernel Implementations
 // Phases 3, 4, 5, 6
@@ -51,10 +52,12 @@ void kernel_matmul_v1(const float* __restrict__ A,
 void launch_matmul_v1(const float* d_A, const float* d_B, float* d_C,
                        int M, int K, int N)
 {
+    validate_matmul(d_A,d_B,d_C,M,K,N); if (!M) return;
+
     constexpr int BS = 16;
     dim3 block(BS, BS);
     dim3 grid((N + BS - 1) / BS, (M + BS - 1) / BS);
-    kernel_matmul_v1<<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    kernel_matmul_v1<<<grid, block, 0, execution_stream()>>>(d_A, d_B, d_C, M, K, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -107,9 +110,11 @@ template<int TILE>
 void launch_matmul_v2(const float* d_A, const float* d_B, float* d_C,
                        int M, int K, int N)
 {
+    validate_matmul(d_A,d_B,d_C,M,K,N); if (!M) return;
+
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    kernel_matmul_v2<TILE><<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    kernel_matmul_v2<TILE><<<grid, block, 0, execution_stream()>>>(d_A, d_B, d_C, M, K, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -203,17 +208,19 @@ void kernel_matmul_v3(const float* __restrict__ A,
 void launch_matmul_v3(const float* d_A, const float* d_B, float* d_C,
                        int M, int K, int N)
 {
+    validate_matmul(d_A,d_B,d_C,M,K,N); if (!M) return;
+
     const int TILE_M = V3_BM * V3_TM;
     const int TILE_N = V3_BN * V3_TN;
     dim3 block(V3_BN, V3_BM);
     dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
-    kernel_matmul_v3<<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    kernel_matmul_v3<<<grid, block, 0, execution_stream()>>>(d_A, d_B, d_C, M, K, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // =============================================================================
-// Phase 5 — V4: Vectorized-Load MatMul
-// Uses float4 (128-bit) loads for better memory throughput on coalesced rows.
+// Phase 5 — V4: Scalar tiled/unrolled MatMul
+// Uses coalesced scalar loads; groups four multiply-adds in the inner loop.
 // Tile = 32×32, each thread loads a float4 from A and B per K-tile step.
 // Constraint: N and K must be multiples of 4 for safe float4 access.
 // The kernel falls back to scalar loads otherwise.
@@ -271,9 +278,11 @@ void kernel_matmul_v4(const float* __restrict__ A,
 void launch_matmul_v4(const float* d_A, const float* d_B, float* d_C,
                        int M, int K, int N)
 {
+    validate_matmul(d_A,d_B,d_C,M,K,N); if (!M) return;
+
     dim3 block(V4_TILE, V4_TILE);
     dim3 grid((N + V4_TILE - 1) / V4_TILE, (M + V4_TILE - 1) / V4_TILE);
-    kernel_matmul_v4<<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    kernel_matmul_v4<<<grid, block, 0, execution_stream()>>>(d_A, d_B, d_C, M, K, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -287,6 +296,10 @@ void launch_matmul_cublas(cublasHandle_t handle,
                            const float* d_A, const float* d_B, float* d_C,
                            int M, int K, int N)
 {
+    validate_matmul(d_A,d_B,d_C,M,K,N); if (!M) return;
+    if (!handle) throw std::invalid_argument("Null cuBLAS handle.");
+    CUBLAS_CHECK(cublasSetStream(handle,execution_stream()));
+
     const float alpha = 1.f, beta = 0.f;
     // Row-major C=A*B  ≡  Column-major  C^T = B^T * A^T
     // sgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)

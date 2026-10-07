@@ -105,6 +105,10 @@ inline void print_all_gpus() {
 // CUDA Event-based timer utility
 // -----------------------------------------------------------------------------
 
+inline thread_local cudaStream_t task_execution_stream = nullptr;
+inline cudaStream_t execution_stream() { return task_execution_stream; }
+inline void set_execution_stream(cudaStream_t s) { task_execution_stream = s; }
+
 struct CudaTimer {
     cudaEvent_t start, stop;
 
@@ -116,8 +120,8 @@ struct CudaTimer {
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
     }
-    void begin() { CUDA_CHECK(cudaEventRecord(start)); }
-    void end()   { CUDA_CHECK(cudaEventRecord(stop));  }
+    void begin() { CUDA_CHECK(cudaEventRecord(start, execution_stream())); }
+    void end()   { CUDA_CHECK(cudaEventRecord(stop, execution_stream()));  }
     float elapsed_ms() {
         float ms = 0.f;
         CUDA_CHECK(cudaEventSynchronize(stop));

@@ -32,7 +32,7 @@ void softmax(const float* d_x, float* d_y, int batch, int cols);
 // Auto-tuner: runs a mini-sweep and saves the fastest config for a shape.
 // Call once during initialisation; results are cached in memory.
 // -----------------------------------------------------------------------------
-void autotune_matmul(int M, int K, int N);
+void autotune_matmul(int M, int K, int N, cublasHandle_t cublas_handle = nullptr);
 void autotune_layernorm(int batch, int hidden);
 void autotune_softmax(int batch, int cols);
 
