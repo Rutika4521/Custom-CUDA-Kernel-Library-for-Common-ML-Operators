@@ -1,6 +1,6 @@
 # Reference target workload
 
-The project uses a GPT-2-style workload because no production model was supplied. The published [GPT-2 configuration](https://huggingface.co/openai-community/gpt2/blob/main/config.json) specifies hidden size 768, 12 heads, and 1024 positions. The [model implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py) uses a default intermediate width of 4 times hidden size (3072).
+The project uses a GPT-2-style workload. The published [GPT-2 configuration](https://huggingface.co/openai-community/gpt2/blob/main/config.json) specifies hidden size 768, 12 heads, and 1024 positions. The [model implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py) uses a default intermediate width of 4 times hidden size (3072).
 
 These are operator microbenchmarks with synthetic deterministic inputs. We do not download weights or claim production/model-level latency results. Sequence lengths and token counts below are selected test scenarios.
 
